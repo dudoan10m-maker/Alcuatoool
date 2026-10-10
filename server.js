@@ -75,23 +75,27 @@ const server = http.createServer(async (req, res) => {
     const content = messages[0] && messages[0].content;
     if (!Array.isArray(content) || content.length > 5) return send(res, 400, { error: 'Invalid content' }, corsOrigin);
     let imageCount = 0;
+    let textCount = 0;
     for (const item of content) {
       if (item && item.type === 'image' && item.source && item.source.type === 'base64') {
         imageCount++;
         if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(item.source.media_type) || typeof item.source.data !== 'string' || item.source.data.length > 3_500_000) {
           return send(res, 400, { error: 'Invalid image payload' }, corsOrigin);
         }
-      } else if (!(item && item.type === 'text' && typeof item.text === 'string' && item.text.length <= 2000)) {
+      } else if (item && item.type === 'text' && typeof item.text === 'string' && item.text.length <= 2000) {
+        textCount++;
+      } else {
         return send(res, 400, { error: 'Unsupported content item' }, corsOrigin);
       }
     }
-    if (imageCount < 1) return send(res, 400, { error: 'At least one image is required' }, corsOrigin);
+    // Accept text-only session analysis; images remain optional.
+    if (imageCount < 1 && textCount < 1) return send(res, 400, { error: 'Text or image content is required' }, corsOrigin);
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: Math.min(Math.max(Number(body.max_tokens) || 32, 1), 64),
+        max_tokens: Math.min(Math.max(Number(body.max_tokens) || 256, 1), 512),
         temperature: 0,
         messages: [{ role: 'user', content }]
       }),
