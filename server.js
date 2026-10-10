@@ -64,7 +64,9 @@ const server = http.createServer(async (req, res) => {
     });
     return res.end();
   }
-  if (path !== '/api/ai') return send(res, 404, { error: 'Not found' }, corsOrigin);
+  // Health check: opening the service root should not show Not found.
+  if (path === '/' && req.method === 'GET') return send(res, 200, { ok: true, service: 'v507-ai-vision', endpoint: '/api/ai' }, corsOrigin);
+  if (path !== '/api/ai') return send(res, 404, { error: 'Not found', expected: '/api/ai' }, corsOrigin);
   if (req.method === 'GET') return send(res, 200, { ok: true, service: 'v507-ai-vision' }, corsOrigin);
   if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed' }, corsOrigin);
   if (!rateLimit(req)) return send(res, 429, { error: 'Rate limit exceeded' }, corsOrigin);
