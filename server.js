@@ -3,7 +3,7 @@
 const http = require('http');
 const PORT = process.env.PORT || 3000;
 const KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 const BASE = process.env.GEMINI_BASE || 'https://generativelanguage.googleapis.com';
 const hits = new Map(); // giới hạn 20 lần/phút/IP để khỏi bị xài lố hạn mức miễn phí
 
