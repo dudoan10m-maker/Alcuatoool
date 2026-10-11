@@ -1,113 +1,65 @@
-// V507 AI Vision backend — Node.js 20+, no API key in the browser.
-// Configure ANTHROPIC_API_KEY, ALLOWED_ORIGIN, PORT in environment.
-const http = require('node:http');
-const { URL } = require('node:url');
+// Máy chủ nhỏ: nhận yêu cầu kiểu Anthropic từ tool, gọi Gemini, trả về đúng dạng tool đọc.
+// Không cần cài thư viện nào. Biến môi trường: GEMINI_API_KEY (bắt buộc), GEMINI_MODEL (tùy chọn).
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+const KEY = process.env.GEMINI_API_KEY;
+const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const BASE = process.env.GEMINI_BASE || 'https://generativelanguage.googleapis.com';
+const hits = new Map(); // giới hạn 20 lần/phút/IP để khỏi bị xài lố hạn mức miễn phí
 
-const PORT = Number(process.env.PORT || 3000);
-const API_KEY = process.env.ANTHROPIC_API_KEY;
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '')
-  .split(',').map(x => x.trim()).filter(Boolean);
-const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
-const MAX_BODY = 8 * 1024 * 1024;
-const WINDOW_MS = 60_000;
-const MAX_REQUESTS_PER_WINDOW = 30;
-const buckets = new Map();
-
-if (!API_KEY) {
-  console.error('Missing ANTHROPIC_API_KEY environment variable');
-  process.exit(1);
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
 }
-
-function send(res, status, body, origin) {
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    'x-content-type-options': 'nosniff',
-    ...(origin ? { 'access-control-allow-origin': origin, 'vary': 'Origin' } : {})
-  });
-  res.end(JSON.stringify(body));
+function send(res, code, obj) {
+  cors(res);
+  res.writeHead(code, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(obj));
 }
-function readJson(req) {
-  return new Promise((resolve, reject) => {
-    let size = 0, chunks = [];
-    req.on('data', c => {
-      size += c.length;
-      if (size > MAX_BODY) { reject(Object.assign(new Error('Request too large'), { status: 413 })); req.destroy(); return; }
-      chunks.push(c);
-    });
-    req.on('end', () => {
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
-      catch { reject(Object.assign(new Error('Invalid JSON'), { status: 400 })); }
-    });
-    req.on('error', reject);
-  });
+function limited(ip) {
+  const now = Date.now(), arr = (hits.get(ip) || []).filter(t => now - t < 60000);
+  arr.push(now); hits.set(ip, arr);
+  return arr.length > 20;
 }
-function rateLimit(req) {
-  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
-  const now = Date.now();
-  let b = buckets.get(ip);
-  if (!b || now - b.start >= WINDOW_MS) b = { start: now, count: 0 };
-  b.count++; buckets.set(ip, b);
-  return b.count <= MAX_REQUESTS_PER_WINDOW;
-}
-const server = http.createServer(async (req, res) => {
-  const origin = req.headers.origin || '';
-  const path = new URL(req.url, `http://${req.headers.host || 'localhost'}`).pathname;
-  if (origin && ALLOWED_ORIGINS.length && !ALLOWED_ORIGINS.includes(origin)) return send(res, 403, { error: 'Origin not allowed' });
-  const corsOrigin = origin && (!ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin)) ? origin : '';
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      ...(corsOrigin ? { 'access-control-allow-origin': corsOrigin, 'vary': 'Origin' } : {}),
-      'access-control-allow-methods': 'GET, POST, OPTIONS',
-      'access-control-allow-headers': 'content-type',
-      'access-control-max-age': '600'
-    });
-    return res.end();
-  }
-  // Health check: opening the service root should not show Not found.
-  if (path === '/' && req.method === 'GET') return send(res, 200, { ok: true, service: 'v507-ai-vision', endpoint: '/api/ai' }, corsOrigin);
-  if (path !== '/api/ai') return send(res, 404, { error: 'Not found', expected: '/api/ai' }, corsOrigin);
-  if (req.method === 'GET') return send(res, 200, { ok: true, service: 'v507-ai-vision' }, corsOrigin);
-  if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed' }, corsOrigin);
-  if (!rateLimit(req)) return send(res, 429, { error: 'Rate limit exceeded' }, corsOrigin);
-  try {
-    const body = await readJson(req);
-    const messages = body && Array.isArray(body.messages) ? body.messages : null;
-    if (!messages || messages.length < 1 || messages.length > 2) return send(res, 400, { error: 'Invalid messages' }, corsOrigin);
-    const content = messages[0] && messages[0].content;
-    if (!Array.isArray(content) || content.length > 5) return send(res, 400, { error: 'Invalid content' }, corsOrigin);
-    let imageCount = 0;
-    let textCount = 0;
-    for (const item of content) {
-      if (item && item.type === 'image' && item.source && item.source.type === 'base64') {
-        imageCount++;
-        if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(item.source.media_type) || typeof item.source.data !== 'string' || item.source.data.length > 3_500_000) {
-          return send(res, 400, { error: 'Invalid image payload' }, corsOrigin);
-        }
-      } else if (item && item.type === 'text' && typeof item.text === 'string' && item.text.length <= 2000) {
-        textCount++;
-      } else {
-        return send(res, 400, { error: 'Unsupported content item' }, corsOrigin);
-      }
+function toGemini(body) {
+  const parts = [];
+  for (const m of body.messages || []) {
+    const c = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : (m.content || []);
+    for (const p of c) {
+      if (p.type === 'image' && p.source && p.source.data)
+        parts.push({ inline_data: { mime_type: p.source.media_type || 'image/jpeg', data: p.source.data } });
+      else if (p.type === 'text') parts.push({ text: p.text });
     }
-    // Accept text-only session analysis; images remain optional.
-    if (imageCount < 1 && textCount < 1) return send(res, 400, { error: 'Text or image content is required' }, corsOrigin);
-    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: Math.min(Math.max(Number(body.max_tokens) || 256, 1), 512),
-        temperature: 0,
-        messages: [{ role: 'user', content }]
-      }),
-      signal: AbortSignal.timeout(30000)
-    });
-    const data = await upstream.json().catch(() => ({}));
-    return send(res, upstream.status, data, corsOrigin);
-  } catch (err) {
-    const status = err.status || (err.name === 'TimeoutError' ? 504 : 500);
-    return send(res, status, { error: status === 500 ? 'Backend request failed' : err.message }, corsOrigin);
   }
-});
-server.listen(PORT, '0.0.0.0', () => console.log(`V507 AI backend listening on ${PORT}`));
+  return {
+    contents: [{ role: 'user', parts }],
+    generationConfig: { temperature: 0, maxOutputTokens: Math.min(body.max_tokens || 500, 1024), responseMimeType: 'application/json' }
+  };
+}
+
+http.createServer((req, res) => {
+  if (req.method === 'OPTIONS') { cors(res); res.writeHead(204); return res.end(); }
+  if (req.method === 'GET') return send(res, 200, { ok: true, model: MODEL, hasKey: !!KEY });
+  if (req.method !== 'POST' || !/^\/(api\/ai)?\/?$/.test(req.url.split('?')[0])) return send(res, 404, { error: { message: 'Not found' } });
+  if (!KEY) return send(res, 500, { error: { message: 'Máy chủ chưa có GEMINI_API_KEY' } });
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  if (limited(ip)) return send(res, 429, { error: { message: 'Quá nhiều yêu cầu, đợi một phút' } });
+  let raw = '';
+  req.on('data', d => { raw += d; if (raw.length > 15e6) req.destroy(); });
+  req.on('end', async () => {
+    try {
+      const body = JSON.parse(raw || '{}');
+      const r = await fetch(`${BASE}/v1beta/models/${MODEL}:generateContent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': KEY },
+        body: JSON.stringify(toGemini(body))
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) return send(res, r.status, { error: { message: (d.error && d.error.message) || ('Gemini HTTP ' + r.status) } });
+      const text = ((d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts) || []).map(p => p.text || '').join('\n');
+      if (!text) return send(res, 502, { error: { message: 'Gemini không trả nội dung (có thể bị chặn)' } });
+      send(res, 200, { content: [{ type: 'text', text }] });
+    } catch (e) { send(res, 500, { error: { message: String(e.message || e) } }); }
+  });
+}).listen(PORT, () => console.log('AI backend chạy ở cổng', PORT));
